@@ -120,13 +120,13 @@ class ThermosTaskRunner(TaskRunner):
     http_signaler = HttpSignaler(self._ports['health'])
 
     # pass 1
-    http_signaler.quitquitquit()
+    http_signaler(self._task.graceful_shutdown_endpoint().get(), use_post_method=True)
     self._clock.sleep(self.ESCALATION_WAIT.as_(Time.SECONDS))
     if self.status is not None:
       return True
 
     # pass 2
-    http_signaler.abortabortabort()
+    http_signaler(self._task.shutdown_endpoint().get(), use_post_method=True)
     self._clock.sleep(self.ESCALATION_WAIT.as_(Time.SECONDS))
     if self.status is not None:
       return True

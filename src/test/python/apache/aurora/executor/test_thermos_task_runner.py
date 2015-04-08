@@ -19,7 +19,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 
 from mesos.interface import mesos_pb2
 from twitter.common import log
@@ -77,17 +79,20 @@ class TestThermosTaskRunnerIntegration(object):
       print('Saving executor logs in %s' % cls.LOG_DIR)
 
   @contextlib.contextmanager
-  def yield_runner(self, runner_class, **bindings):
+  def yield_runner(self, runner_class, health_port=None, **bindings):
     with contextlib.nested(temporary_dir(), temporary_dir()) as (td1, td2):
       sandbox = DirectorySandbox(td1)
       checkpoint_root = td2
+      portmap = {}
+      if health_port:
+        portmap['health'] = health_port
 
       task_runner = runner_class(
           runner_pex=os.path.join('dist', 'thermos_runner.pex'),
           task_id='hello_world',
           task=TASK.bind(**bindings).task(),
           role=getpass.getuser(),
-          portmap={},
+          portmap=portmap,
           sandbox=sandbox,
           checkpoint_root=checkpoint_root,
       )
@@ -188,7 +193,7 @@ class TestThermosTaskRunnerIntegration(object):
       assert task_runner.status is not None
       assert task_runner.status.status == mesos_pb2.TASK_LOST
 
-  def test_integration_quitquitquit(self):
+  def test_integration_ignores_sigterm(self):
     ignorant_script = ';'.join([
         'import time, signal',
         'signal.signal(signal.SIGTERM, signal.SIG_IGN)',
@@ -197,7 +202,6 @@ class TestThermosTaskRunnerIntegration(object):
 
     class ShortPreemptionThermosTaskRunner(ThermosTaskRunner):
       THERMOS_PREEMPTION_WAIT = Amount(1, Time.SECONDS)
-
     with self.yield_runner(
         ShortPreemptionThermosTaskRunner,
         command="%s -c '%s'" % (sys.executable, ignorant_script)) as task_runner:
@@ -205,6 +209,41 @@ class TestThermosTaskRunnerIntegration(object):
       task_runner.start()
       task_runner.forked.wait()
       task_runner.stop(timeout=Amount(5, Time.SECONDS))
+      assert task_runner.status is not None
+      assert task_runner.status.status == mesos_pb2.TASK_KILLED
+
+  def test_integration_http_endpoints_hit(self):
+    script = ';'.join([
+        'import time',
+        'time.sleep(1000)'
+    ])
+
+    endpoints = []
+    class Handler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        endpoints.append(self.path)
+
+    server = HTTPServer(('', 0), Handler)
+    class ServerThread(threading.Thread):
+      def run(self):
+        server.handle_request()
+        server.handle_request()
+    server_thread = ServerThread()
+    server_thread.daemon = True
+    server_thread.start()
+
+    class ShortEscalationThermosTaskRunner(ThermosTaskRunner):
+      ESCALATION_WAIT = Amount(1, Time.SECONDS)
+    with self.yield_runner(
+        ShortEscalationThermosTaskRunner,
+        health_port=server.server_port,
+        command="%s -c '%s'" % (sys.executable, script)) as task_runner:
+
+      task_runner.start()
+      task_runner.forked.wait()
+      task_runner.stop(timeout=Amount(5, Time.SECONDS))
+      assert '/quitquitquit' == endpoints[0]
+      assert '/abortabortabort' == endpoints[1]
       assert task_runner.status is not None
       assert task_runner.status.status == mesos_pb2.TASK_KILLED
 
