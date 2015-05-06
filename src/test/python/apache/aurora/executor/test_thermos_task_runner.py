@@ -19,7 +19,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from mesos.interface import mesos_pb2
@@ -83,6 +85,8 @@ class TestThermosTaskRunnerIntegration(object):
     with contextlib.nested(temporary_dir(), temporary_dir()) as (td1, td2):
       sandbox = DirectorySandbox(td1)
       checkpoint_root = td2
+      if not portmap:
+          portmap = {}
 
       task_runner = runner_class(
           runner_pex=os.path.join('dist', 'thermos_runner.pex'),
@@ -195,7 +199,7 @@ class TestThermosTaskRunnerIntegration(object):
       assert task_runner.status.status == mesos_pb2.TASK_LOST
 
   @pytest.mark.skipif('True', reason='Flaky test (AURORA-1054)')
-  def test_integration_quitquitquit(self):
+  def test_integration_ignores_sigterm(self):
     ignorant_script = ';'.join([
         'import time, signal',
         'signal.signal(signal.SIGTERM, signal.SIG_IGN)',
@@ -204,7 +208,6 @@ class TestThermosTaskRunnerIntegration(object):
 
     class ShortPreemptionThermosTaskRunner(ThermosTaskRunner):
       THERMOS_PREEMPTION_WAIT = Amount(1, Time.SECONDS)
-
     with self.yield_runner(
         ShortPreemptionThermosTaskRunner,
         command="%s -c '%s'" % (sys.executable, ignorant_script)) as task_runner:
@@ -215,32 +218,40 @@ class TestThermosTaskRunnerIntegration(object):
       assert task_runner.status is not None
       assert task_runner.status.status == mesos_pb2.TASK_KILLED
 
-  @patch('apache.aurora.executor.thermos_task_runner.HttpSignaler')
-  def test_integration_http_teardown(self, SignalerClass):
-    signaler = SignalerClass.return_value
-    signaler.quitquitquit.return_value = (False, 'failed to dispatch')
-    signaler.abortabortabort.return_value = (True, None)
+  def test_integration_http_endpoints_hit(self):
+    script = ';'.join([
+        'import time',
+        'time.sleep(1000)'
+    ])
 
-    clock = Mock(wraps=time)
+    endpoints = []
+    class Handler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        endpoints.append(self.path)
 
-    class ShortEscalationRunner(ThermosTaskRunner):
-      ESCALATION_WAIT = Amount(1, Time.MICROSECONDS)
+    server = HTTPServer(('', 0), Handler)
+    class ServerThread(threading.Thread):
+      def run(self):
+        server.handle_request()
+        server.handle_request()
+    server_thread = ServerThread()
+    server_thread.daemon = True
+    server_thread.start()
 
-    with self.yield_sleepy(
-        ShortEscalationRunner,
-        portmap={'health': 3141},
-        clock=clock,
-        sleep=1000,
-        exit_code=0) as task_runner:
+    class ShortEscalationThermosTaskRunner(ThermosTaskRunner):
+      ESCALATION_WAIT = Amount(1, Time.SECONDS)
+    with self.yield_runner(
+        ShortEscalationThermosTaskRunner,
+        portmap={'health': server.server_port},
+        command="%s -c '%s'" % (sys.executable, script)) as task_runner:
 
       task_runner.start()
       task_runner.forked.wait()
-
-      task_runner.stop()
-
-      escalation_wait = call(ShortEscalationRunner.ESCALATION_WAIT.as_(Time.SECONDS))
-      assert clock.sleep.mock_calls.count(escalation_wait) == 1
-      assert signaler.mock_calls == [call.quitquitquit(), call.abortabortabort()]
+      task_runner.stop(timeout=Amount(5, Time.SECONDS))
+      assert '/quitquitquit' == endpoints[0]
+      assert '/abortabortabort' == endpoints[1]
+      assert task_runner.status is not None
+      assert task_runner.status.status == mesos_pb2.TASK_KILLED
 
   def test_thermos_normal_exit_status(self):
     with self.exit_with_status(0, TaskState.SUCCESS) as task_runner:
